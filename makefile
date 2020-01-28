@@ -23,7 +23,7 @@ $1/%.o: %.f90
 	
 # add dependencies
 # can this be done automatically?
-$1/pk_data_types.o: $1/pk_kinds.o $1/pk_enumeration.o
+$1/pk_data_types.o: $1/pk_kinds.o $1/pk_enumeration.o $1/pk_utility.o
 $1/pk_master.o: $1/pk_runner.o
 $1/pk_runner.o: $1/pk_data_types.o $1/pk_read_input.o $1/pk_write_output.o $1/pk_time_control.o $1/pk_methods.o
 

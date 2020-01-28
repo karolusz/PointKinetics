@@ -1,70 +1,18 @@
-Z 4 0.000001 1 3 0.000000000001
-0 1 0.5
-1 -1 1
--1 1 1.5
-0.5 0 10
-%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-first row:
-	type of case: ZIG ZAG
-	number of following lines to read
-	edit step size
-	neutron eq solution option
-	precursor eq solution option
-	neutron dens. convergence criteria
-each consecutive row:
-	rho(0)
-	time multiplier a ( rho(t) = rho(0) + a*t )
-	last time step: must be divisible by delta_t
-    
-    for the step insertion a should be 0 by default
-%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-
-R 1 0.0001 0 3 0.000000000001
+R 1 0 1 3 0 1E-5 1E-4 1 0
 0 0.1 11
 %%%%%%%%%%%%%%%%%%%%%%%%%%
 first row:
 	type of case: RAMP
 	number of following lines to read
-	edit step size
+	edit step size (if 0, there will be no edits at regular intervals. Time-knots are also read from time_knots.in)
 	neutron eq solution option
 	precursor eq solution option
-	neutron dens. convergence criteria
+	time step size - use 0 for adaptive time steps, otherwise a constant time step will be used
+	eps_TOL
+	eps_n_eos
+	omega convergence option
+	convergence pararameter choice
 second row:
 	rho(0)
 	time multiplier a ( rho(t) = rho(0) + a*t )
 	last time step: must be divisible by the time step
-	
-I 1 0.1 2 3 0.000000000001
--0.5 0 10
-%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-first row:
-	type of case: STEP INSERTION
-	number of following lines to read
-	edit step size
-	neutron eq solution option
-	precursor eq solution option
-	neutron dens. convergence criteria
-second row:
-	rho(0)
-	time multiplier a ( rho(t) = rho(0) + a*t )
-	last time step: must be divisible by delta_t
-    
-    for the step insertion a should be 0 by default
-%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-    
-S 1 0.000001 1 1 0.000000000001
-8 50 800
-%%%%%%%%%%%%%%%%%%%%%%%%%%
-first row:
-	type of case: SINUSOIDAL VARIATION
-	number of following lines to read
-	edit step size
-	neutron eq solution option
-	precursor eq solution option
-	neutron dens. convergence criteria
-second row:
-    coefficient from  page 164 of Barry's paper
-    half-period
-    last time step
-%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-
