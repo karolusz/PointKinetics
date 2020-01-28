@@ -29,9 +29,11 @@ MODULE pk_methods
 !  Import variables
    USE pk_kinds       , ONLY: dp
    USE pk_enumeration , ONLY: C_FULLY_IMPLICIT    , C_CONSTANT_APPROX, C_LINEAR_APPROX , C_EXPONENT_APPROX, &
-                              N_FULLY_IMPLICIT    , N_FREQUENCY_TRANS
+                              N_NO_FREQUENCY_TRANS, N_FREQUENCY_TRANS, OMEGA_NO        , OMEGA_YES        , &
+                              CONV_N              , CONV_W
    USE pk_data_types  , ONLY: set_data            , solution_at_step , pc_group        , max_n_eos_iter   , &
-                              n_solution          , pre_approx       , epsilon_n_eos
+                              n_solution          , pre_approx       , epsilon_n_eos   , omega_option     , &
+                              converg_opt
 !
    IMPLICIT NONE
 !
@@ -41,6 +43,10 @@ MODULE pk_methods
 !  ------------------
    PUBLIC :: point_kinetics_step ! Subroutine that performs one point kinetic time step
    PUBLIC :: pk_methods_init     ! Initializes the this module.
+!
+!  Module variables
+!  ------------------
+   REAL(dp), SAVE :: omega       ! Neutron density frequency. Set to zero at first. Save between the time steps.
 !
 !=======================================================================================================================
 CONTAINS
@@ -66,8 +72,13 @@ SUBROUTINE point_kinetics_step(&
    delta_t,                    & ! IN (s)
    n_eos,                      & ! OUT (1/cm^3)
    n_eos_p1,                   & ! OUT (1/cm^3)
+   n_eos_tsc,                  & ! OUT (1/cm^3 or -)
+   n_eos_p1_tsc,               & ! OUT (1/cm^3 or -)
    c_eos,                      & ! OUT (1/cm^3)
-   inner_iter )                  ! OUT (-)
+   inner_iter,                 & ! OUT (1/s)
+   omega_out,                  & ! OUT (-)
+   omega_rt,                   & ! OUT (-)
+   n_eos_rt )                    ! OUT (-)
 !=======================================================================================================================
 ! Record of revisions:
 !       Date     Programmer  Description of change
@@ -88,14 +99,17 @@ SUBROUTINE point_kinetics_step(&
    REAL(dp), INTENT(IN)  :: rho_bos     ! Reactivity at the beginning of step              (-)
    REAL(dp), INTENT(IN)  :: delta_t     ! Time step size                                   (1/s)
 !
-   REAL(dp), INTENT(OUT) :: n_eos      ! Core average neutron density at EOS from the 2nd order method (1/cm^3)
-   REAL(dp), INTENT(OUT) :: n_eos_p1   ! Core average neutron density at EOS from the 1st order method (1/cm^3)
-   REAL(dp), INTENT(OUT) :: c_eos(:)   ! Group-wise precursors' concentration at EOS                   (1/cm^3)
-   INTEGER,  INTENT(OUT) :: inner_iter ! Count of inner iterations.                                    (no unit)
+   REAL(dp), INTENT(OUT) :: n_eos      ! Core average neutron density at EOS from the 2nd order method   (1/cm^3)
+   REAL(dp), INTENT(OUT) :: n_eos_p1   ! Core average neutron density at EOS from the 1st order method   (1/cm^3)
+   REAL(dp), INTENT(OUT) :: n_eos_tsc  ! Core average n. dens. at EOS (for time step control). 2nd order method.
+   REAL(dp), INTENT(OUT) :: n_eos_p1_tsc ! Core average n. dens. at EOS (for time step control). 1st order method.
+   REAL(dp), INTENT(OUT) :: c_eos(:)   ! Group-wise precursors' concentration at EOS                     (1/cm^3)
+   REAL(dp), INTENT(OUT) :: omega_out  ! Frequecny                                                       (1/s)
+   INTEGER,  INTENT(OUT) :: inner_iter ! Count of inner iterations.                                      (no unit)
+   REAL(dp), INTENT(OUT) :: omega_rt   ! Relative difference between omega iterations (from conv. check))(-)
+   REAL(dp), INTENT(OUT) :: n_eos_rt   ! Relative difference between iterations of n_eos                 (-)
 !
 !  Locals
-!
-   REAL(dp) :: omega_n            ! Neutron density frequency
 ! 
    REAL(dp) :: x_tilde(pc_group) ! c_eos equation coefficient
    REAL(dp) :: y_tilde(pc_group) ! c_eos equation coefficient
@@ -136,6 +150,10 @@ SUBROUTINE point_kinetics_step(&
 !  This value will be used for local truncation error estimate.
 !  --------------------------------------------
    CALL INNER_first_order_n()
+!
+!  Determine eos values for time step control
+!  --------------------------------------------
+   CALL INNER_time_step_control_variables()
 !
 !  --------------------------------------------
 !  Internal subroutines
@@ -200,6 +218,7 @@ SUBROUTINE point_kinetics_step(&
       INTEGER :: idx ! Loop index variable.
       REAL(dp) :: n_eos_i1           ! Previous iteration step neutron density         (1/cm^3)
       REAL(dp) :: c_eos_i1(pc_group) ! Previous iteration step precursor concentration (1/cm^3)
+      REAL(dp) :: omega_i1           ! Previous iteration step omega (-)
 !
 !     MAIN LOOP FOR N_EOS ITERATIONS
 !     -------------------------------
@@ -207,10 +226,9 @@ SUBROUTINE point_kinetics_step(&
 !
       loop_implicit: DO idx = 1, max_n_eos_iter
 !
-         omega_n = log(n_eos/n_bos) / delta_t ! Update the omega_n value.
-         n_eos_i1= n_eos                      ! Save pre-iteration n_eos value.
-         c_eos_i1(:) = c_eos(:)               ! Save pre-iteration c_eos value.
-         inner_iter = idx                     ! Track number of iterations performed by the subroutine.
+         n_eos_i1= n_eos        ! Save pre-iteration n_eos value.
+         c_eos_i1(:) = c_eos(:) ! Save pre-iteration c_eos value.
+         inner_iter = idx       ! Track number of iterations performed by the subroutine.
 !
 !     Check if the exponential fission source approximation was selected.
 !     -------------------------------------------------------------------
@@ -221,12 +239,17 @@ SUBROUTINE point_kinetics_step(&
             delta_t  = delta_t , & ! IN (s)
             n_bos    = n_bos   , & ! IN (1/cm^3)
             n_eos    = n_eos   , & ! IN (1/cm^3)
+            omega_p  = omega   , & ! IN (-)
             x_tilde  = x_tilde , & ! OUT (-)
             y_tilde  = y_tilde , & ! OUT (-)
             z_tilde  = z_tilde)    ! OUT (-)
 !
       ENDIF
 !
+!     If n equation option is not frequency transformed: set omega to 0.
+!                                             otheriwse: use actual omega
+!     -------------------------------------------------------------------
+      IF (n_solution == N_NO_FREQUENCY_TRANS) THEN
          CALL update_n_eos(&
             gen_time = gen_time, & ! IN (s)
             lambda_l = lambda_l, & ! IN (1/s)
@@ -238,17 +261,62 @@ SUBROUTINE point_kinetics_step(&
             x_tilde  = x_tilde , & ! IN (-)
             y_tilde  = y_tilde , & ! IN (-)
             z_tilde  = z_tilde , & ! IN (-)
-            omega_n  = omega_n , & ! IN (-)
+            omega_n  = 0.0_dp  , & ! IN (-)
             theta    = theta   , & ! IN (-)
             c_bos    = c_bos   , & ! IN (-)
             n_bos    = n_bos   , & ! IN (1/cm^3)
             n_eos    = n_eos)      ! OUT (1/cm^3)
+!
+      ELSE
+         CALL update_n_eos(&
+            gen_time = gen_time, & ! IN (s)
+            lambda_l = lambda_l, & ! IN (1/s)
+            delta_t  = delta_t , & ! IN (s)
+            rho_eos  = rho_eos , & ! IN (-)
+            rho_bos  = rho_bos , & ! IN (-)
+            beta     = beta    , & ! IN (-)
+            beta_l   = beta_l  , & ! IN (-)
+            x_tilde  = x_tilde , & ! IN (-)
+            y_tilde  = y_tilde , & ! IN (-)
+            z_tilde  = z_tilde , & ! IN (-)
+            omega_n  = omega   , & ! IN (-)
+            theta    = theta   , & ! IN (-)
+            c_bos    = c_bos   , & ! IN (-)
+            n_bos    = n_bos   , & ! IN (1/cm^3)
+            n_eos    = n_eos)      ! OUT (1/cm^3)      
+!
+      ENDIF
 ! 
 !     Check convergence of n_eos or if only one pass (fully implicit) was requested. if 'yes' to any, break the loop.
 !
-         IF ( abs(n_eos - n_eos_i1)/n_eos <= epsilon_n_eos ) THEN
-            EXIT loop_implicit  
+         110 FORMAT ( I2, ES14.6, ES14.6, ES14.6, ES14.6, ES14.6, ES14.6 )
+         WRITE(*,110) inner_iter, delta_t, n_bos, n_eos, omega, rho_bos, rho_eos
+!
+         IF (omega_option == OMEGA_YES) THEN
+            omega_i1 = omega
+            omega = log(n_eos/n_bos) / delta_t ! Update the omega value.
          ENDIF
+!
+         omega_rt = abs(omega - omega_i1)/omega
+         n_eos_rt = abs(n_eos - n_eos_i1)/n_eos
+!
+         convergence_check: SELECT CASE (converg_opt)
+!
+            CASE (CONV_N)
+!           
+               IF ((n_eos_rt <= epsilon_n_eos) .OR. (idx == max_n_eos_iter)) THEN
+                  omega_out = omega
+                  EXIT loop_implicit
+               ENDIF
+!
+            CASE (CONV_W)
+!
+               IF ((omega_rt <= epsilon_n_eos) .OR. (idx == max_n_eos_iter)) THEN
+                  omega_out = omega
+                  EXIT loop_implicit
+               ENDIF
+!
+         END SELECT convergence_check
 !
       END DO loop_implicit
    END SUBROUTINE INNER_n_eos_main_loop
@@ -256,40 +324,49 @@ SUBROUTINE point_kinetics_step(&
    SUBROUTINE INNER_first_order_n()
 !=======================================================================================================================
 !     Calculate the n_eos using the first order method (for local truncation error estimate later on).
-!     Fully implicit method is assumed (no iterations needed). To avoid the necessity of iterations the fission source
-!     approximaion is kept the same unless it is an exponential approximation (substituted with linear approx. instead)
+!     Fully implicit method is assumed (no iterations needed). The omega is set back to 1.0 for methotds without 
+!     frequency transformation.
 !     ------------
-      omega_n = 0.0_dp
       theta = 1.0_dp
-!
-      IF (pre_approx == C_EXPONENT_APPROX) THEN
-         CALL pc_linea_approx(&
-            lambda_l = lambda_l, & ! IN (1/s)
-            delta_t  = delta_t , & ! IN (s)
-            x_tilde  = x_tilde , & ! OUT (-)
-            y_tilde  = y_tilde , & ! OUT (-)
-            z_tilde  = z_tilde)    ! OUT (-)
+      IF (n_solution == N_NO_FREQUENCY_TRANS) THEN
+         omega = 1.0_dp
       ENDIF
 !
       CALL update_n_eos(&
-         gen_time = gen_time, & ! IN (s)
-         lambda_l = lambda_l, & ! IN (1/s)
-         delta_t  = delta_t , & ! IN (s)
-         rho_eos  = rho_eos , & ! IN (-)
-         rho_bos  = rho_bos , & ! IN (-)
-         beta     = beta    , & ! IN (-)
-         beta_l   = beta_l  , & ! IN (-)
-         x_tilde  = x_tilde , & ! IN (-)
-         y_tilde  = y_tilde , & ! IN (-)
-         z_tilde  = z_tilde , & ! IN (-)
-         omega_n  = omega_n , & ! IN (-)
-         theta    = theta   , & ! IN (-)
-         c_bos    = c_bos   , & ! IN (-)
-         n_bos    = n_bos   , & ! IN (1/cm^3)
-         n_eos    = n_eos_p1)   ! OUT (1/cm^3)
+         gen_time = gen_time , & ! IN (s)
+         lambda_l = lambda_l , & ! IN (1/s)
+         delta_t  = delta_t  , & ! IN (s)
+         rho_eos  = rho_eos  , & ! IN (-)
+         rho_bos  = rho_bos  , & ! IN (-)
+         beta     = beta     , & ! IN (-)
+         beta_l   = beta_l   , & ! IN (-)
+         x_tilde  = x_tilde  , & ! IN (-)
+         y_tilde  = y_tilde  , & ! IN (-)
+         z_tilde  = z_tilde  , & ! IN (-)
+         omega_n  = omega    , & ! IN (-)
+         theta    = theta    , & ! IN (-)
+         c_bos    = c_bos    , & ! IN (-)
+         n_bos    = n_bos    , & ! IN (1/cm^3)
+         n_eos    = n_eos_p1)    ! OUT (1/cm^3)
 !
    END SUBROUTINE INNER_first_order_n
+!=======================================================================================================================
+   SUBROUTINE INNER_time_step_control_variables()
+!=======================================================================================================================
+!     Sets the approptiate values for variables used in the time-step control. For non frequency transformed methods
+!     these are equal to end of step neutron densiities. For frequncy transfromed methods these should be transformed
+!     rather than abosulte values.
+!     ------------
+      IF (n_solution == N_NO_FREQUENCY_TRANS) THEN
+         n_eos_tsc = n_eos
+         n_eos_p1_tsc = n_eos_p1
+      ELSE
+         n_eos_tsc = n_eos * exp(-1.0_dp * omega * delta_t)
+         n_eos_p1_tsc = n_eos_p1 * exp(-1.0_dp * omega * delta_t)
+      ENDIF
 !
+   END SUBROUTINE INNER_time_step_control_variables
+
 END SUBROUTINE point_kinetics_step
 !=======================================================================================================================
 !
@@ -319,9 +396,9 @@ SUBROUTINE pc_thimp_approx(&
    REAL(dp), INTENT(IN) :: lambda_l(:) ! Precursor decay constants (1/s)
    REAL(dp), INTENT(IN) :: delta_t     ! Time step size            (s)
 !
-   REAL(dp), INTENT(OUT) :: x_tilde(:)  ! Factor in EOS delayed n. pre. density equation (-)
-   REAL(dp), INTENT(OUT) :: y_tilde(:)  ! Factor in EOS delayed n. pre. density equation (-)
-   REAL(dp), INTENT(OUT) :: z_tilde(:)  ! Factor in EOS delayed n. pre. density equation (-)
+   REAL(dp), INTENT(OUT) :: x_tilde(:) ! Factor in EOS delayed n. pre. density equation (-)
+   REAL(dp), INTENT(OUT) :: y_tilde(:) ! Factor in EOS delayed n. pre. density equation (-)
+   REAL(dp), INTENT(OUT) :: z_tilde(:) ! Factor in EOS delayed n. pre. density equation (-)
 !
 !  Locals
 !
@@ -368,9 +445,9 @@ SUBROUTINE pc_const_approx(&
    REAL(dp), INTENT(IN) :: lambda_l(:) ! Precursor decay constants (1/s)
    REAL(dp), INTENT(IN) :: delta_t     ! Time step size            (1/s)
 !
-   REAL(dp), INTENT(OUT) :: x_tilde(:)  ! Factor in EOS delayed n. pre. density equation
-   REAL(dp), INTENT(OUT) :: y_tilde(:)  ! Factor in EOS delayed n. pre. density equation
-   REAL(dp), INTENT(OUT) :: z_tilde(:)  ! Factor in EOS delayed n. pre. density equation
+   REAL(dp), INTENT(OUT) :: x_tilde(:) ! Factor in EOS delayed n. pre. density equation
+   REAL(dp), INTENT(OUT) :: y_tilde(:) ! Factor in EOS delayed n. pre. density equation
+   REAL(dp), INTENT(OUT) :: z_tilde(:) ! Factor in EOS delayed n. pre. density equation
 !
 !  Locals
 !
@@ -414,9 +491,9 @@ SUBROUTINE pc_linea_approx(&
    REAL(dp), INTENT(IN) :: lambda_l(:) ! Precursor decay constants (1/s)
    REAL(dp), INTENT(IN) :: delta_t     ! Time step size            (1/s)
 !
-   REAL(dp), INTENT(OUT) :: x_tilde(:)  ! Factor in EOS delayed n. pre. density equation
-   REAL(dp), INTENT(OUT) :: y_tilde(:)  ! Factor in EOS delayed n. pre. density equation
-   REAL(dp), INTENT(OUT) :: z_tilde(:)  ! Factor in EOS delayed n. pre. density equation
+   REAL(dp), INTENT(OUT) :: x_tilde(:) ! Factor in EOS delayed n. pre. density equation
+   REAL(dp), INTENT(OUT) :: y_tilde(:) ! Factor in EOS delayed n. pre. density equation
+   REAL(dp), INTENT(OUT) :: z_tilde(:) ! Factor in EOS delayed n. pre. density equation
 !
 !  Locals
 !
@@ -446,6 +523,7 @@ SUBROUTINE pc_expon_approx(&
    delta_t,                & ! IN (s)
    n_bos,                  & ! IN (1/cm^3)
    n_eos,                  & ! IN (1/cm^3)
+   omega_p,                & ! IN
    x_tilde,                & ! OUT (-)
    y_tilde,                & ! OUT (-)
    z_tilde)                  ! OUT (-)
@@ -463,15 +541,15 @@ SUBROUTINE pc_expon_approx(&
    REAL(dp), INTENT(IN) :: delta_t     ! Time step size (1/s)
    REAL(dp), INTENT(IN) :: n_bos       ! Beginning of step neutron dependence
    REAL(dp), INTENT(IN) :: n_eos       ! End of step neutron density
+   REAL(dp), INTENT(IN) :: omega_p     ! Frequency
 !
-   REAL(dp), INTENT(OUT) :: x_tilde(:)  ! Factor in EOS delayed n. pre. density equation
-   REAL(dp), INTENT(OUT) :: y_tilde(:)  ! Factor in EOS delayed n. pre. density equation
-   REAL(dp), INTENT(OUT) :: z_tilde(:)  ! Factor in EOS delayed n. pre. density equation
+   REAL(dp), INTENT(OUT) :: x_tilde(:) ! Factor in EOS delayed n. pre. density equation
+   REAL(dp), INTENT(OUT) :: y_tilde(:) ! Factor in EOS delayed n. pre. density equation
+   REAL(dp), INTENT(OUT) :: z_tilde(:) ! Factor in EOS delayed n. pre. density equation
 !
 !  Locals
 !
    INTEGER  :: idx               ! Loop index variable
-   REAL(dp) :: omega_l(pc_group) ! Frequency for each precursor equation
 !   
 !  Calculations
 !
@@ -480,10 +558,8 @@ SUBROUTINE pc_expon_approx(&
       x_tilde(idx) = exp(-1.0_dp*lambda_l(idx)*delta_t)
       y_tilde(idx) = lambda_l(idx)*exp(-1.0_dp*lambda_l(idx)*delta_t)
 !
-      omega_l(idx) = (log(n_eos/n_bos)) / delta_t
-!
-      z_tilde(idx) = lambda_l(idx) * exp(-1.0_dp*(omega_l(idx) + lambda_l(idx)) * delta_t)* &
-                   ((exp((omega_l(idx)+lambda_l(idx))*delta_t) - 1.0_dp) / (omega_l(idx) + lambda_l(idx)) - 1.0_dp)
+      z_tilde(idx) = lambda_l(idx) * exp(-1.0_dp*(omega_p + lambda_l(idx)) * delta_t)* &
+                   ((exp((omega_p+lambda_l(idx))*delta_t) - 1.0_dp) / (omega_p + lambda_l(idx)) - 1.0_dp)
 !
    END DO expon_approx
 END SUBROUTINE pc_expon_approx
@@ -526,10 +602,10 @@ SUBROUTINE get_hats(&
    REAL(dp), INTENT(IN) :: y_tilde(:)  ! Factor in EOS delayed n. pre. density equation
    REAL(dp), INTENT(IN) :: z_tilde(:)  ! Factor in EOS delayed n. pre. density equation	  
 !
-   REAL(dp), INTENT(OUT) :: x_hat       ! Factor in EOS neutron density equation
-   REAL(dp), INTENT(OUT) :: y_hat       ! Factor in EOS neutron density equation
-   REAL(dp), INTENT(OUT) :: z_hat       ! Factor in EOS neutron density equation
-   REAL(dp), INTENT(OUT) :: c_hat       ! Factor in EOS neutron density equation
+   REAL(dp), INTENT(OUT) :: x_hat ! Factor in EOS neutron density equation
+   REAL(dp), INTENT(OUT) :: y_hat ! Factor in EOS neutron density equation
+   REAL(dp), INTENT(OUT) :: z_hat ! Factor in EOS neutron density equation
+   REAL(dp), INTENT(OUT) :: c_hat ! Factor in EOS neutron density equation
 !
 !  Locals
 !
@@ -622,13 +698,15 @@ SUBROUTINE update_n_eos(&
 !
 !  Locals
 !
-   REAL(dp) :: a1       ! Factor in EOS neutron density equation
-   REAL(dp) :: a2       ! Factor in EOS neutron density equation
+   REAL(dp) :: A        ! Factor in EOS neutron density equation
+   REAL(dp) :: B        ! Factor in EOS neutron density equation
+   REAL(dp) :: Q
    REAL(dp) :: freq_exp ! Factor a1 and a2 equation
    REAL(dp) :: x_hat    ! Factor in EOS neutron density equation
    REAL(dp) :: y_hat    ! Factor in EOS neutron density equation
    REAL(dp) :: z_hat    ! Factor in EOS neutron density equation
    REAL(dp) :: c_hat    ! Factor in EOS neutron density equation
+   REAL(dp) :: test 
 !      
 !  Calculations
 ! 
@@ -647,13 +725,24 @@ SUBROUTINE update_n_eos(&
 !
 !  Calculate freq_exp, a2 and a1
 !  -----------------------------
+!   For testing the frequencies.
+!   c_hat = 0.0_dp
+!   z_hat = 0.0_dp
+!   x_hat = 0.0_dp
+!   y_hat = 0.0_dp
    freq_exp = exp(-1.0_dp * omega_n * delta_t)
-   a1 = freq_exp *(1.0_dp - delta_t * theta * ((rho_eos - beta) / gen_time + z_hat - omega_n ))
-   a2 = 1.0_dp+delta_t * (1.0_dp - theta) * ((rho_bos - beta) / gen_time - omega_n) + theta * freq_exp * delta_t * y_hat
+   test = (rho_bos - beta) / gen_time - omega_n
+   B = freq_exp *(1.0_dp - delta_t * theta * ((rho_eos - beta) / gen_time + z_hat - omega_n ))
+   A = 1.0_dp+delta_t * (1.0_dp - theta) * ((rho_bos - beta) / gen_time - omega_n) + theta * freq_exp * delta_t * y_hat
+   Q =  delta_t * ( (1.0_dp -theta) * c_hat + freq_exp * theta * x_hat )
 !
 !  Calculate n(t_i+1)
 !  ------------------
-   n_eos = n_bos * a2 / a1 + delta_t * (1.0_dp -theta) * c_hat / a1 + freq_exp * delta_t * theta * x_hat / a1
+   n_eos = n_bos * A / B + delta_t * (1.0_dp -theta) * c_hat / B + freq_exp * delta_t * theta * x_hat / B
+   109 FORMAT (ES14.6, ES14.6, ES14.6, ES14.6, ES14.6, ES14.6, ES14.6, ES14.6, ES14.6, ES14.6, ES14.6)
+   WRITE(*,109) n_bos, n_eos, omega_n, freq_exp, test, A, B, Q, A/B, Q/B, z_hat
+!   108 FORMAT (ES14.6)
+!   WRITE(*,108) y_hat
 !  
 END SUBROUTINE update_n_eos
 !=======================================================================================================================
@@ -736,10 +825,18 @@ SUBROUTINE pk_methods_init()
 !  or if the exponential fission source approximation is to be used in the precursor equation
 !  If yes, then set max_n_eos_iter to 1.
 !  ------------------------------------------------------------------------------------------
-   IF (n_solution == N_FULLY_IMPLICIT) THEN
+   omega = 0.0_dp ! Sets initial value of omega to zero.
+!
+   IF (n_solution == N_NO_FREQUENCY_TRANS) THEN
       IF (pre_approx /= C_EXPONENT_APPROX) THEN
          CALL set_data("max_n_eos_iter", 1)
       ENDIF
+   ENDIF
+!
+!  If convergence on omega is requested. Omega HAS to be updated between iterations.
+!
+   IF (converg_opt == CONV_W) THEN
+      CALL set_data("omega_option",1)
    ENDIF
 !
 END SUBROUTINE pk_methods_init

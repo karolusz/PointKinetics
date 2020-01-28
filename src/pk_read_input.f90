@@ -24,7 +24,7 @@ MODULE pk_read_input
 !
 !=======================================================================================================================
    USE pk_kinds     , ONLY: dp
-   USE pk_data_types, ONLY: set_data, allocate_1d
+   USE pk_data_types, ONLY: set_data, allocate_1d, set_dt_options
 !
    IMPLICIT NONE 
 !
@@ -86,7 +86,7 @@ REAL(dp) FUNCTION rho_dollar(&
    type_of_input,            & !  IN
    a_table,                  & !  IN
    b_table,                  & !  IN
-   time_table,               & !  IN
+   time_table_rho,           & !  IN
    lambda)                     !  IN, OPTIONAL
 !=======================================================================================================================
 ! Record of revisions:
@@ -102,7 +102,7 @@ REAL(dp) FUNCTION rho_dollar(&
    CHARACTER(LEN=1), INTENT(IN)  :: type_of_input ! Reactivity input type
    REAL(dp)        , INTENT(IN)  :: a_table(:)    ! Table of a coefficients for linear reactivity eq. Rho(t) = a*t + b
    REAL(dp)        , INTENT(IN)  :: b_table(:)    ! Table of b coefficients for linear reactivity eq. Rho(t) = a*t + b
-   REAL(dp)        , INTENT(IN)  :: time_table(:) ! Table of time entries for a_table and b_table.
+   REAL(dp)        , INTENT(IN)  :: time_table_rho(:) ! Table of time entries for a_table and b_table.
 !
 !  Optional arguments (needed for a sinusoidal reactivity case)
 !
@@ -117,8 +117,8 @@ REAL(dp) FUNCTION rho_dollar(&
 !
 !  Check which reactivity equation is to be used for the current time-step
 !  a_table, b_table and time_table all have the same size
-   DO idx = 1, SIZE(time_table)
-      IF (time_current <= time_table(idx)) THEN
+   DO idx = 1, SIZE(time_table_rho)
+      IF (time_current <= time_table_rho(idx)) THEN
 !        Select the type of reactivity input
          SELECT CASE (type_of_input)
 !
@@ -158,6 +158,7 @@ END FUNCTION rho_dollar
 SUBROUTINE process_input(&
    kin_param_file_path,  & ! IN
    reactivity_file_path, & ! IN
+   time_knots_file_path, & ! IN
    ierror)                 ! OUT
 !=======================================================================================================================
 ! Record of revisions:
@@ -171,6 +172,7 @@ SUBROUTINE process_input(&
 !
    CHARACTER(*) , INTENT(IN)  :: kin_param_file_path  ! Kinetics parameters input filepath
    CHARACTER(*) , INTENT(IN)  :: reactivity_file_path ! Reactivity input filepath
+   CHARACTER(*) , INTENT(IN)  :: time_knots_file_path ! Time knots input filepath
    INTEGER      , INTENT(OUT) :: ierror ! Error number
 !
 !  Process the reactivity input file
@@ -182,8 +184,14 @@ SUBROUTINE process_input(&
 !  Process the reactor input file
 !  ------------------------------
    CALL process_reactivity_input(&
-      filename    = reactivity_file_path, & ! IN
-      ierror      = ierror)                 ! OUT
+      filename = reactivity_file_path, & ! IN
+      ierror   = ierror)                 ! OUT
+!
+!  Process the time knots input fle
+!  ------------------------------
+   CALL process_time_knots_input(&
+      filename = time_knots_file_path, & ! IN
+      ierror   = ierror)                 ! OUT
 !
 END SUBROUTINE process_input
 !=======================================================================================================================
@@ -237,7 +245,7 @@ SUBROUTINE process_reactor_input(&
       RETURN
    ENDIF   
 !
-!  Read number of lines and time step
+!  Read number of lines (precursor families)
 !  ----------------------------------
    READ(unit_pkp,*, IOSTAT = ierror) pc_group_r, gen_time
    IF (ierror /= 0) THEN
@@ -303,14 +311,18 @@ SUBROUTINE process_reactivity_input(&
    INTEGER  :: idx                   ! Loop index variable
    REAL(dp) :: time                  ! Total simulation time
    INTEGER  :: lines                 ! Number of lines to be read from the input file
-   REAL(dp) :: edit_delta_t          ! Time step
+   REAL(dp) :: edit_delta_in         ! Time step of edits
    INTEGER  :: unit_ri               ! Reactivity input file unit number
    REAL(dp) :: a_table_r             ! Variable to store a_table entry from the input file.
    REAL(dp) :: b_table_r             ! Variable to store b_table entry from the input file.
    REAL(dp) :: time_table_r          ! Variable to store time_table entry from the input file.
    INTEGER  :: n_solution_in         ! Neutron density equation solution option
    INTEGER  :: pre_approx_in         ! Pre-cursor concentration equation solution option
-   REAL(dp) :: epsilon_n_eos_in      ! Neutron density convergence criteria
+   REAL(dp) :: tol_rel_in            ! Truncation error tolerance input
+   REAL(dp) :: eps_in                ! Convergence criterion value input
+   REAL(dp) :: delta_t_in            ! User sepecified delta t. 0 for adaptive times step. Otherwise const delta_t
+   INTEGER  :: omega_option          ! Option to either retain omega between iterations or update during each iteration
+   INTEGER  :: converg_opt           ! Option to convergen on either neutron density or omega.
    CHARACTER(LEN=1) :: type_of_input ! Type of reactivity input
 !
 ! Open the reactivity file
@@ -323,16 +335,22 @@ SUBROUTINE process_reactivity_input(&
       RETURN
    ENDIF     
 !
-   READ(unit_ri, *, IOSTAT = ierror) type_of_input, lines, edit_delta_t, n_solution_in, pre_approx_in, epsilon_n_eos_in
+   READ(unit_ri, *, IOSTAT = ierror) type_of_input, lines , edit_delta_in, n_solution_in, pre_approx_in, delta_t_in, &
+                                     tol_rel_in   , eps_in, omega_option , converg_opt
    IF (ierror /= 0) THEN
       WRITE(*,*) 'Error occurred when reading reactivity file. IOSTAT error: ', ierror
       RETURN
    ENDIF 
 !
-   CALL set_data("edit_delta_t",edit_delta_t)
+   CALL set_dt_options(delta_t_in = delta_t_in)
+   CALL set_data("edit_delta_t",edit_delta_in)
+   CALL set_data("tol_rel", tol_rel_in)
+   CALL set_data("epsilon_n_eos", eps_in)
+   CALL set_data("omega_option",omega_option)
+   CALL set_data("converg_opt",converg_opt)
    CALL allocate_1d("a_table", lines)
    CALL allocate_1d("b_table", lines)
-   CALL allocate_1d("time_table", lines)
+   CALL allocate_1d("time_table_rho", lines)
 !
    process_input_select: SELECT CASE (type_of_input)
 !
@@ -346,7 +364,7 @@ SUBROUTINE process_reactivity_input(&
          ELSE
             CALL set_data("b_table", b_table_r, idx)
             CALL set_data("a_table", a_table_r, idx)
-            CALL set_data("time_table", time_table_r, idx)
+            CALL set_data("time_table_rho", time_table_r, idx)
          ENDIF         
       END DO   
       time = time_table_r !  The last entry from the file defines the total simulation time
@@ -360,7 +378,7 @@ SUBROUTINE process_reactivity_input(&
       ELSE
          CALL set_data("a_table", a_table_r, 1)
          CALL set_data("b_table", b_table_r, 1)
-         CALL set_data("time_table", time_table_r, 1)
+         CALL set_data("time_table_rho", time_table_r, 1)
       ENDIF  
       time = time_table_r !  The last entry from the file defines the total simulation time
 !
@@ -380,9 +398,71 @@ SUBROUTINE process_reactivity_input(&
 !
    CALL set_data("n_solution", n_solution_in)
    CALL set_data("pre_approx", pre_approx_in)
-   CALL set_data("epsilon_n_eos", epsilon_n_eos_in)
 !
 END SUBROUTINE process_reactivity_input
+!=======================================================================================================================
+!
+!  ****************************
+!  * process_time_knots_input *
+!  ****************************
+!
+!  Purpose: Process the time knots input file.
+!
+!=======================================================================================================================
+SUBROUTINE process_time_knots_input(&
+   filename,                        & ! IN
+   ierror)                            ! OUT
+!=======================================================================================================================
+! Record of revisions:
+!       Date       Programmer               Description of changes
+!       -----------------------------------------------------------
+!       27/09/18   K. Luszczek              Original code
+!       11/03/18   K. Luszczek              Modified to use derived data types
+!
+!=======================================================================================================================
+!
+!  Arguments
+!
+   CHARACTER(*) , INTENT(IN)  :: filename ! File path to the reactivity input
+   INTEGER      , INTENT(OUT) :: ierror   ! Error handling number
+!
+!  Locals
+!
+   INTEGER  :: idx                   ! Loop index variable
+   REAL(dp) :: edit_time             ! Time at which an edit is requested (read from file).
+   INTEGER  :: lines                 ! Number of lines to be read from the input file
+   INTEGER  :: unit_ri               ! Reactivity input file unit number
+!
+! Open the reactivity file
+!  ------------------------
+   unit_ri = newunit()
+!
+   OPEN (UNIT = unit_ri, FILE = filename, STATUS = 'OLD', ACTION = 'READ', IOSTAT = ierror) ! Open the reactivity file
+   IF (ierror /= 0) THEN
+      WRITE(*,*) 'Error occurred when opening reactivity file. IOSTAT error: ', ierror
+      RETURN
+   ENDIF     
+!
+   READ(unit_ri, *, IOSTAT = ierror) lines
+   IF (ierror /= 0) THEN
+      WRITE(*,*) 'Error occurred when reading reactivity file. IOSTAT error: ', ierror
+      RETURN
+   ENDIF 
+!
+   CALL allocate_1d("edit_table", lines)
+!
+      DO idx = 1, lines
+         READ(unit_ri,*, IOSTAT = ierror) edit_time
+         IF (ierror /= 0) THEN
+            WRITE(*,*) 'Error occurred when reading reactivity file. IOSTAT error: ', ierror
+            RETURN
+         ELSE
+            CALL set_data("edit_table", edit_time, idx)
+
+         ENDIF         
+      END DO   
+!
+END SUBROUTINE process_time_knots_input
 !=======================================================================================================================
 END MODULE pk_read_input
 !=======================================================================================================================
